@@ -1,0 +1,10 @@
+{
+    "manufacturer": "Hexcore",
+    "url": "https://www.hexcore.xyz/",
+    "maintainer": "danielcanencia",
+    "features": {
+        "bootmagic": true,
+        "mousekey": true,
+        "extrakey": true
+    }
+}
