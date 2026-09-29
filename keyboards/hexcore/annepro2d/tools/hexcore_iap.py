@@ -69,18 +69,27 @@ HIDIOCSOUTPUT = _ioc(_IOC_RW, _HIDRAW, 0x0B, 0)
 HEXCORE_VID = 0x0311
 IAP_PID = 0xA293
 
-TARGETS = {"usb": 1, "ble": 2, "main": 3, "led": 4, "blemcu": 5}
+# Target ids as they appear in the high nibble of frame byte 2.
+TARGETS = {"usb": 1, "blehost": 2, "main": 3, "led": 4, "ble": 5}
+TARGET_NAMES = {v: k for k, v in TARGETS.items()}
 L2_FW = 0x02
 
-CMD_IAP_MODE = 0x02
+# KeyCommand values, from OpenAnnePro/AnnePro2-Tools (src/annepro2.rs).
+CMD_IAP_MODE = 0x01          # "boot the target"; the value is followed by 0x02
 CMD_GET_MODE = 0x02
 CMD_GET_FW_VERSION = 0x03
 CMD_WRITE_MEMORY = 0x31
 CMD_WRITE_AP_FLAG = 0x32
 CMD_ERASE_MEMORY = 0x43
 
-CHUNK_SIZE = {3: 48, 4: 48, 5: 32}   # payload bytes per chunk, per target
-DEFAULT_BASE = 0x4000                # Obins bootloaders occupy the first 16 KiB
+# The reference tool uses 32-byte chunks for the BLE MCU and 48 for the rest.
+CHUNK_SIZE = {5: 32}          # payload bytes per chunk; 48 is the default
+DEFAULT_CHUNK = 48
+DEFAULT_BASE = 0x4000         # Obins bootloaders occupy the first 16 KiB
+
+# The boot frame is the one command the reference tool sends unpadded, with a
+# comment saying it must not be zero-padded to the full report size.
+BOOT_PAYLOAD = bytes([L2_FW, CMD_IAP_MODE, 0x02])
 
 LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
 # Without argtypes, ctypes refuses to convert a bytearray and the call raises
@@ -144,16 +153,29 @@ def wait_for_iap(seconds=300):
 
 
 FRAME_MAGIC = 0x7B
+FRAME_TRAILER = 0x7D
 FRAME_SIZE = 64
 
+# Frame byte 2 packs the addressee in the high nibble and the direction in the
+# low one. Requests go host (UsbHost = 1) to a target; replies come back from
+# that target addressed to UsbHost, so the nibbles are not symmetric and the
+# addressee of a reply is not the target you asked.
+_DIR_TO_IAP, _DIR_TO_HOST = 0x01, 0x03
 
-def build_frame(target, payload):
-    frame = bytearray([FRAME_MAGIC, 0x10, ((target & 0xF) << 4) | 0x01, 0x10,
-                       len(payload), 0x00, 0x00, 0x7D])
+
+def build_frame(target, payload, pad=True):
+    """Wrap a payload in the 7b 10 .. 7d envelope, zero-padded to 64 bytes.
+
+    `pad=False` sends the bare 11-byte envelope instead, which the boot command
+    requires.
+    """
+    frame = bytearray([FRAME_MAGIC, 0x10, ((target & 0xF) << 4) | _DIR_TO_IAP, 0x10,
+                       len(payload), 0x00, 0x00, FRAME_TRAILER])
     frame.extend(payload)
     if len(frame) > FRAME_SIZE:
         raise ValueError(f"frame too long ({len(frame)} > {FRAME_SIZE})")
-    frame.extend(b"\x00" * (FRAME_SIZE - len(frame)))
+    if pad:
+        frame.extend(b"\x00" * (FRAME_SIZE - len(frame)))
     return bytes(frame)
 
 
@@ -208,7 +230,7 @@ class IapDevice:
             return data[1:]
         return data
 
-    def command(self, target, payload, raw=False, report=True):
+    def command(self, target, payload, raw=False, report=True, pad=True):
         """Send one command; return the reply bytes (or None if silent).
 
         The transfer goes through read()/write() rather than
@@ -216,16 +238,20 @@ class IapDevice:
 
         * hidraw treats the first byte of a written buffer as the report number
           (hidraw_send_report in drivers/hid/hidraw.c), but for a device whose
-          report enum is not "numbered" that byte is data, not a header.
+          report enum is not "numbered" that byte is data, not a header. The
+          reference tool reaches the same result through libusb, which strips
+          the report number instead.
         * usbhid_output_report() drops a leading 0x00 byte outright, reading it
           as a report ID that a non-numbered device has no use for.
 
         A frame starting with the 0x7B magic byte therefore reaches the device
-        as exactly the 64 bytes built here, and the 0x7B is also what tells us
+        as exactly the bytes built here, and the 0x7B is also what tells us
         whether a reply came back with a report number in front of it. Run
-        `descriptor` to see which convention the device declares.
+        `descriptor` to see which convention the device declares; on this
+        keyboard it is the no-report-id one, confirmed by replies arriving as
+        64 bytes opening with 0x7B.
         """
-        frame = payload if raw else build_frame(target, payload)
+        frame = payload if raw else build_frame(target, payload, pad=pad)
         assert frame[0] == FRAME_MAGIC, "a leading zero byte would be dropped by usbhid"
         os.write(self.fd, frame)
 
@@ -252,6 +278,7 @@ class IapDevice:
 # ------------------------------------------------------------------ helpers ---
 
 def fmt(reply, limit=24):
+    """Raw hex of a reply, for debugging. cmd_info uses describe_frame instead."""
     if reply is None:
         return "<no reply>"
     body = " ".join(f"{b:02x}" for b in reply[:limit])
@@ -319,12 +346,29 @@ def parse_descriptor(desc):
 
 
 def describe_frame(reply):
-    """Decode the fixed part of a reply frame, if it looks like one."""
+    """Decode a reply frame: who it is addressed to, and the payload.
+
+    Byte 2 packs the addressee in the high nibble and the direction in the low
+    one. A reply is addressed back to UsbHost, so its high nibble is 1 even
+    when the query went to McuMain; reading that nibble as "the target" gives
+    the wrong answer, which is why the two are labelled separately.
+    """
     if reply is None or len(reply) < 8 or reply[0] != FRAME_MAGIC:
         return None
-    target = (reply[2] >> 4) & 0xF
+    to = (reply[2] >> 4) & 0xF
+    direction = (reply[2] & 0xF) == _DIR_TO_HOST and "to host" or "to iap"
+    if reply[7] != FRAME_TRAILER:
+        return f"MALFORMED (trailer {reply[7]:02x}, expected {FRAME_TRAILER:02x})"
     length = reply[4]
-    return f"target={target} len={length} trailer={reply[7]:02x}"
+    payload = reply[8:8 + length]
+    parts = [f"to={TARGET_NAMES.get(to, to)}", direction, f"len={length}"]
+    if len(payload) >= 2 and payload[0] == L2_FW:
+        cmd = {CMD_GET_MODE: "IapGetMode", CMD_GET_FW_VERSION: "IapGetFwVersion",
+               CMD_IAP_MODE: "IapMode"}.get(payload[1], f"0x{payload[1]:02x}")
+        parts.append(cmd)
+        rest = payload[2:]
+        parts.append(f"rest={rest.hex()}" if rest else "rest=<empty>")
+    return "  ".join(parts)
 
 
 def print_descriptor(dev):
@@ -356,26 +400,28 @@ def resolve_device(args):
 # ---------------------------------------------------------------- commands ---
 
 def cmd_info(args, dev):
-    print(f"\nUSB: {HEXCORE_VID:04x}:{IAP_PID:04x}  frame=64B\n")
+    print(f"\nUSB: {HEXCORE_VID:04x}:{IAP_PID:04x}  frame={FRAME_SIZE}B\n")
     print_descriptor(dev)
 
-    print("\nRead-only queries (no writes are issued):\n")
-    for tname in ("main", "ble", "led", "usb"):
+    print("\nRead-only queries (no writes are issued).\n")
+    print("Frame byte 2 carries the addressee in its high nibble, so a reply is")
+    print("addressed back to UsbHost whichever MCU answered it.\n")
+    for tname in ("main", "ble", "led", "blehost", "usb"):
         target = TARGETS[tname]
         for keycmd, kname in ((CMD_GET_MODE, "IapGetMode"),
                               (CMD_GET_FW_VERSION, "IapGetFwVersion")):
             reply = dev.command(target, bytes([L2_FW, keycmd]))
+            line = f"  [{tname:7s}] {kname:15s} -> "
             decoded = describe_frame(reply)
-            line = f"  [{tname:4s}] {kname:16s} -> {fmt(reply)}"
-            if decoded:
-                line += f"   ({decoded})"
-            print(line)
+            print(line + (decoded if decoded else "<no reply>"))
 
     if dev.last_raw is not None:
         print(f"\n  last raw report as read(): {len(dev.last_raw)} bytes, "
               f"first byte 0x{dev.last_raw[0]:02x}")
-    print("\nVersion bytes are little-endian; the first two bytes of an "
-          "IapGetFwVersion reply are usually the firmware version (major.minor).")
+
+    print("\nIapGetMode returns one status byte. IapGetFwVersion returns a 30-byte")
+    print("blob whose layout the reference flashing tool never decodes, so it is")
+    print("printed raw above rather than guessed at.")
 
 
 def cmd_descriptor(args, dev):
@@ -386,7 +432,7 @@ def cmd_descriptor(args, dev):
 
 def cmd_flash(args, dev):
     target = TARGETS[args.target]
-    chunk_size = CHUNK_SIZE.get(target, 48)
+    chunk_size = CHUNK_SIZE.get(target, DEFAULT_CHUNK)
     with open(args.file, "rb") as fh:
         image = fh.read()
     if not image:
@@ -434,10 +480,10 @@ def cmd_flash(args, dev):
     dev.command(target, bytes([L2_FW, CMD_WRITE_AP_FLAG, 0x02]))
 
     print("Booting the keyboard...")
-    # build_frame already emits the 7b 10 .. 7d envelope, so wrapping the whole
-    # frame again would produce a double header. The bootloader does not answer
-    # this one; it just resets into the application.
-    dev.command(target, bytes([L2_FW, CMD_IAP_MODE, 0x02]), report=False)
+    # The reference tool sends this one unpadded, with a comment saying it must
+    # not be zero-padded to the full report size, and with the target hardcoded
+    # to McuMain. Pad to 64 and the bootloader does not act on it.
+    dev.command(TARGETS["main"], BOOT_PAYLOAD, report=False, pad=False)
     print("Done. Unplug and replug the keyboard.")
 
 
