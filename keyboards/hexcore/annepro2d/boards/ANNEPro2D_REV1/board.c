@@ -15,6 +15,7 @@
 */
 
 #include "hal.h"
+#include "bootloader.h"
 
 /* ============ Private Defines ===================== */
 
@@ -106,3 +107,26 @@ const PALConfig pal_default_config = {
 void __early_init(void) { ht32_clock_init(); }
 
 void boardInit(void) {}
+
+/*
+ * Jump back into the vendor IAP bootloader.
+ *
+ * rules.mk sets BOOTLOADER = custom, which on ChibiOS resolves to a set of
+ * empty weak stubs in platforms/chibios/bootloaders/custom.c - so without this
+ * QK_BOOT would silently do nothing and there would be no way out of a QMK
+ * build.
+ *
+ * There is no flag to poke here. The Obins bootloader sits in the first 16 KiB
+ * of flash, which the application image never touches, and it decides at reset
+ * whether to stay in IAP by sampling Esc. So the way in is to reset while Esc
+ * is held down: hold Esc, press QK_BOOT, and the board comes up in IAP mode.
+ *
+ * Pressing QK_BOOT without Esc held just restarts the keymap.
+ */
+void bootloader_jump(void) { NVIC_SystemReset(); }
+
+/*
+ * Plain restart of the keymap, without the Esc-held IAP detour. Also a weak
+ * stub under BOOTLOADER = custom, which would make every reset request a no-op.
+ */
+void mcu_reset(void) { NVIC_SystemReset(); }
