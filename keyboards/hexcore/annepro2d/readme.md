@@ -57,9 +57,34 @@ plug USB back in, and release Esc once a device containing `IAP` appears.
 # read-only: query bootloader state and firmware versions
 sudo python3 keyboards/hexcore/annepro2d/tools/hexcore_iap.py info --wait
 
+# read-only: running firmware version, from the USB descriptors.
+# Needs no root and no IAP mode - run it with the keyboard in normal mode.
+python3 keyboards/hexcore/annepro2d/tools/hexcore_iap.py usb
+
 # preview a flash without touching the device
 python3 keyboards/hexcore/annepro2d/tools/hexcore_iap.py flash firmware.bin --dry-run
 ```
 
-Flashing **erases** the main MCU firmware, so the stock build should be kept
-locally before writing anything. See the tool's docstring for the wire format.
+### Reading the firmware version
+
+`usb` is the only command that reports a usable version. `info` does return an
+`IapGetFwVersion` payload, but it is a 32-byte blob of a 2-byte header plus
+three byte-identical 10-byte records (`00 00 00 40 00 00 00 fe 01 00`) that
+the bootloader builds at run time. It holds no version string, so the tool
+dumps it rather than guessing at a layout.
+
+The USB device descriptor's `bcdDevice` does carry it, and this port declares
+`device_version: 2.0.0`, so a QMK build reports the same `0x0200` the stock
+firmware does and enumerates as the same `0311:a298` device.
+
+### Before flashing
+
+Flashing **erases** the main MCU firmware, and the IAP protocol has no
+read-back command, so the currently installed firmware cannot be saved. Keep a
+copy of the vendor image you want to restore.
+
+`flash` checks the image before erasing anything: it rejects anything that
+does not fit the app region, and it requires the vector table to have an
+in-RAM initial stack pointer and a Thumb reset vector pointing into flash.
+
+See the tool's docstring for the wire format.

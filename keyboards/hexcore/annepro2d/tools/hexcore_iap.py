@@ -32,6 +32,7 @@ Subcommands:
 
     info        read-only queries (bootloader mode / firmware versions)
     descriptor  read-only: dump the HID report descriptor
+    usb         read-only: board version from the USB descriptors, no IAP needed
     flash       erase + write + boot  ** DESTROYS the keyboard's firmware **
 
 To enter IAP mode: turn the wireless switch off, unplug USB, hold Esc, plug USB back
@@ -86,6 +87,17 @@ CMD_ERASE_MEMORY = 0x43
 CHUNK_SIZE = {5: 32}          # payload bytes per chunk; 48 is the default
 DEFAULT_CHUNK = 48
 DEFAULT_BASE = 0x4000         # Obins bootloaders occupy the first 16 KiB
+
+# Memory map, from ld/HT32F52352_ANNEPro2D_REV1.ld. Used to sanity check an image
+# before erasing anything.
+RAM_START = 0x20000000
+RAM_END = RAM_START + 16 * 1024
+FLASH_START = DEFAULT_BASE
+FLASH_END = FLASH_START + (128 * 1024 - 16 * 1024)
+
+# Normal (non-IAP) USB ids. The bootloader shows up as IAP_PID; the running
+# firmware as this one, with bcdDevice carrying the firmware version.
+APP_PID = 0xA298
 
 # The boot frame is the one command the reference tool sends unpadded, with a
 # comment saying it must not be zero-padded to the full report size.
@@ -368,7 +380,8 @@ def describe_frame(reply):
     if reply is None or len(reply) < 8 or reply[0] != FRAME_MAGIC:
         return None
     to = (reply[2] >> 4) & 0xF
-    direction = (reply[2] & 0xF) == _DIR_TO_HOST and "to host" or "to iap"
+    toward_host = (reply[2] & 0xF) == _DIR_TO_HOST
+    direction = "to host" if toward_host else "to iap"
     if reply[7] != FRAME_TRAILER:
         return f"MALFORMED (trailer {reply[7]:02x}, expected {FRAME_TRAILER:02x})"
     length = reply[4]
@@ -376,8 +389,16 @@ def describe_frame(reply):
     parts = [f"to={TARGET_NAMES.get(to, to)}", direction, f"len={length}"]
     if len(payload) >= 2 and payload[0] == L2_FW:
         cmd = {CMD_GET_MODE: "IapGetMode", CMD_GET_FW_VERSION: "IapGetFwVersion",
-               CMD_IAP_MODE: "IapMode"}.get(payload[1], f"0x{payload[1]:02x}")
+               CMD_IAP_MODE: "IapMode", CMD_ERASE_MEMORY: "IapEraseMemory"}.get(
+                   payload[1], f"0x{payload[1]:02x}")
         parts.append(cmd)
+    if not toward_host:
+        # A reply is always addressed back to UsbHost. A "to iap" direction means
+        # the frame is going the other way, so it is not an answer to our query
+        # even though it carries a plausible-looking payload. Flagged rather
+        # than decoded, since it is seen when a target does not implement the
+        # command we sent it.
+        parts.append("<NOT A REPLY: still heading toward the bootloader>")
     return "  ".join(parts)
 
 
@@ -432,15 +453,138 @@ def cmd_info(args, dev):
         print(f"\n  last raw report as read(): {len(dev.last_raw)} bytes, "
               f"first byte 0x{dev.last_raw[0]:02x}")
 
-    print("\nIapGetMode returns one status byte. IapGetFwVersion returns a 30-byte")
-    print("blob whose layout the reference flashing tool never decodes, so it is")
-    print("dumped above rather than guessed at.")
+    print("\nIapGetMode returns one status byte.")
+    print("IapGetFwVersion replies with a 32-byte payload: a 2-byte header")
+    print("(0x02 L2Command::FW, 0x03 IapGetFwVersion) followed by three 10-byte")
+    print("records that are byte-identical on real hardware. The 10-byte record")
+    print("is 00 00 00 40 00 00 00 fe 01 00, it contains no ASCII, and it does")
+    print("not occur in the vendor application image, so the bootloader builds it")
+    print("at run time rather than carrying a compiled-in copy. No readable")
+    print("firmware version is recovered from it.")
+    print("\nUse the `usb` subcommand with the keyboard in normal mode instead:")
+    print("its USB bcdDevice reports the running firmware version.")
 
 
 def cmd_descriptor(args, dev):
     """Read-only: report what the HID interface actually looks like."""
     print(f"\nUSB: {HEXCORE_VID:04x}:{IAP_PID:04x}\n")
     print_descriptor(dev)
+
+
+# ------------------------------------------------------------- usb identity ---
+
+def _read_sysfs(path):
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def scan_usb_identities():
+    """Every currently enumerated USB device claiming to be a Hexcore board.
+
+    Unlike the IAP queries this needs no bootloader, no root and no special key
+    held down: it just reads sysfs. In normal mode bcdDevice is the firmware
+    version, which is the only place on this board where a version shows up in
+    a form we can read.
+    """
+    found = []
+    try:
+        entries = sorted(os.listdir("/sys/bus/usb/devices"))
+    except OSError:
+        return found
+    for name in entries:
+        base = os.path.join("/sys/bus/usb/devices", name)
+        if not os.path.isdir(base):
+            continue
+        vendor = _read_sysfs(os.path.join(base, "idVendor"))
+        if vendor is None or vendor.lower() != f"{HEXCORE_VID:04x}":
+            continue
+        product_id = _read_sysfs(os.path.join(base, "idProduct")) or "????"
+        bcd = _read_sysfs(os.path.join(base, "bcdDevice"))
+        found.append({
+            "sysfs": name,
+            "product": _read_sysfs(os.path.join(base, "product")) or "",
+            "manufacturer": _read_sysfs(os.path.join(base, "manufacturer")) or "",
+            "pid": product_id,
+            "bcdDevice": bcd,
+        })
+    return found
+
+
+def cmd_usb(args, dev):
+    """Read-only, works with the board in normal (non-IAP) mode."""
+    ids = scan_usb_identities()
+    if not ids:
+        print(f"\nNo {HEXCORE_VID:04x}:* device is enumerated right now.")
+        print("Plug the keyboard in over USB with the wireless switch OFF.")
+        return
+
+    print(f"\n{len(ids)} Hexcore USB device(s) enumerated:\n")
+    for i, d in enumerate(ids):
+        in_iap = d["pid"].lower() == f"{IAP_PID:04x}"
+        print(f"  [{i}] {d['sysfs']}  {HEXCORE_VID:04x}:{d['pid']}"
+              f"   {'(bootloader / IAP mode)' if in_iap else '(keyboard firmware)'}")
+        if d["manufacturer"]:
+            print(f"        manufacturer: {d['manufacturer']}")
+        print(f"        product     : {d['product']}")
+        bcd = d["bcdDevice"]
+        if bcd:
+            try:
+                value = int(bcd, 16)
+                major, minor = value >> 8, value & 0xFF
+                print(f"        bcdDevice   : 0x{value:04x}  -> firmware {major}.{minor:02x}")
+            except ValueError:
+                print(f"        bcdDevice   : {bcd}")
+
+    app = [d for d in ids if d["pid"].lower() == f"{APP_PID:04x}"]
+    if app:
+        print("\nThe keyboard firmware is running. This is the only version read")
+        print("on the board that the IAP commands do not expose.")
+    else:
+        print("\nNo running keyboard firmware is enumerated (the board is in IAP")
+        print("mode). Replug without holding Esc to read its version.")
+    print("\nRead-only: nothing was sent to the keyboard.")
+
+
+def check_image(image, base=DEFAULT_BASE):
+    """Sanity check a firmware image before erasing anything.
+
+    The IAP protocol has no read-back command, so a bad write is not
+    recoverable from the host. These checks catch the two realistic mistakes -
+    handing the tool the wrong file, and a truncated build - before the erase.
+    """
+    problems = []
+    if base < FLASH_START or base + len(image) > FLASH_END:
+        problems.append(
+            f"image does not fit the app region: "
+            f"0x{base:08x}..0x{base + len(image):08x} vs "
+            f"0x{FLASH_START:08x}..0x{FLASH_END:08x}")
+    if len(image) < 8:
+        problems.append("image is too short to contain a vector table")
+        return problems
+
+    initial_sp, reset_vector = struct.unpack_from("<II", image, 0)
+    # The low bit of a Cortex-M reset vector is the Thumb state bit and must be
+    # set; the address itself is masked off before the range check.
+    if not reset_vector & 1:
+        problems.append(
+            f"reset vector 0x{reset_vector:08x} has the Thumb bit clear - "
+            "this does not look like ARM Cortex-M firmware")
+    elif not FLASH_START <= (reset_vector & ~1) < FLASH_END:
+        problems.append(
+            f"reset vector 0x{reset_vector:08x} points outside flash - "
+            "this does not look like firmware for this board")
+
+    if not RAM_START <= initial_sp <= RAM_END:
+        problems.append(
+            f"initial stack pointer 0x{initial_sp:08x} is outside RAM "
+            f"(0x{RAM_START:08x}..0x{RAM_END:08x})")
+    elif initial_sp & 3:
+        problems.append(
+            f"initial stack pointer 0x{initial_sp:08x} is not word aligned")
+    return problems
 
 
 def cmd_flash(args, dev):
@@ -456,6 +600,15 @@ def cmd_flash(args, dev):
     print(f"Image       : {args.file} ({len(image)} bytes, "
           f"{len(image) / chunk_size:.0f} chunks of {chunk_size} B)")
     print(f"Base address: 0x{base:08x} -> ends at 0x{base + len(image):08x}")
+
+    problems = check_image(image, base)
+    if problems:
+        print("\nRefusing to erase: the image does not look like firmware for")
+        print("this board. Nothing has been sent to the keyboard.")
+        for p in problems:
+            print(f"  - {p}")
+        sys.exit(1)
+    print("Image checks: vector table and size look sane.")
 
     if args.dry_run:
         print("\nDry run: would erase the main MCU firmware from 0x"
@@ -511,6 +664,10 @@ def main():
     p_desc = sub.add_parser("descriptor", help="read-only: dump the HID report descriptor")
     p_desc.set_defaults(func=cmd_descriptor)
 
+    p_usb = sub.add_parser(
+        "usb", help="read-only: board version from USB descriptors (normal mode)")
+    p_usb.set_defaults(func=cmd_usb, device=None)
+
     p_flash = sub.add_parser("flash", help="erase and write firmware (DESTRUCTIVE)")
     p_flash.add_argument("file", help="firmware binary to write")
     p_flash.add_argument("-t", "--target", choices=TARGETS, default="main")
@@ -529,6 +686,14 @@ def main():
                        help="wait for IAP mode to be entered (default 300s)")
 
     args = parser.parse_args()
+
+    # `usb` reads sysfs and needs neither a bootloader nor root, so it must not
+    # go through device resolution - that would abort when the board is in
+    # normal mode, which is exactly when it is useful.
+    if args.cmd == "usb":
+        args.func(args, None)
+        return
+
     path, name = resolve_device(args)
     if name:
         print(f"IAP device: {name}")
