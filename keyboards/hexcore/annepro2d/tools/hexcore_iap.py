@@ -277,14 +277,6 @@ class IapDevice:
 
 # ------------------------------------------------------------------ helpers ---
 
-def fmt(reply, limit=24):
-    """Raw hex of a reply, for debugging. cmd_info uses describe_frame instead."""
-    if reply is None:
-        return "<no reply>"
-    body = " ".join(f"{b:02x}" for b in reply[:limit])
-    return body + (" ..." if len(reply) > limit else "")
-
-
 # An HID item is one prefix byte followed by bSize data bytes, where the prefix
 # packs bSize in bits 0-1, bType in bits 2-3 and bTag in bits 4-7 (HID 1.11
 # 6.2.2). Keying on (bType << 4) | bTag keeps main-type and global-type items
@@ -345,6 +337,26 @@ def parse_descriptor(desc):
     return lines
 
 
+def hexdump(data, indent="      ", width=16):
+    """Offset-indexed hex dump, so a reply payload can be read off by hand."""
+    lines = []
+    for off in range(0, len(data), width):
+        row = data[off:off + width]
+        hexes = " ".join(f"{b:02x}" for b in row)
+        ascii_ = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
+        lines.append(f"{indent}{off:04x}  {hexes:<{width * 3 - 1}}  |{ascii_}|")
+    return lines
+
+
+def reply_payload(reply):
+    """The payload of a well-formed reply, or None."""
+    if reply is None or len(reply) < 8 or reply[0] != FRAME_MAGIC:
+        return None
+    if reply[7] != FRAME_TRAILER:
+        return None
+    return reply[8:8 + reply[4]]
+
+
 def describe_frame(reply):
     """Decode a reply frame: who it is addressed to, and the payload.
 
@@ -366,8 +378,6 @@ def describe_frame(reply):
         cmd = {CMD_GET_MODE: "IapGetMode", CMD_GET_FW_VERSION: "IapGetFwVersion",
                CMD_IAP_MODE: "IapMode"}.get(payload[1], f"0x{payload[1]:02x}")
         parts.append(cmd)
-        rest = payload[2:]
-        parts.append(f"rest={rest.hex()}" if rest else "rest=<empty>")
     return "  ".join(parts)
 
 
@@ -411,9 +421,12 @@ def cmd_info(args, dev):
         for keycmd, kname in ((CMD_GET_MODE, "IapGetMode"),
                               (CMD_GET_FW_VERSION, "IapGetFwVersion")):
             reply = dev.command(target, bytes([L2_FW, keycmd]))
-            line = f"  [{tname:7s}] {kname:15s} -> "
             decoded = describe_frame(reply)
-            print(line + (decoded if decoded else "<no reply>"))
+            print(f"  [{tname:7s}] {kname:15s} -> {decoded or '<no reply>'}")
+            payload = reply_payload(reply)
+            if payload:
+                for line in hexdump(payload):
+                    print(line)
 
     if dev.last_raw is not None:
         print(f"\n  last raw report as read(): {len(dev.last_raw)} bytes, "
@@ -421,7 +434,7 @@ def cmd_info(args, dev):
 
     print("\nIapGetMode returns one status byte. IapGetFwVersion returns a 30-byte")
     print("blob whose layout the reference flashing tool never decodes, so it is")
-    print("printed raw above rather than guessed at.")
+    print("dumped above rather than guessed at.")
 
 
 def cmd_descriptor(args, dev):
